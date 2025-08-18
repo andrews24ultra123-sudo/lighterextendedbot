@@ -48,9 +48,12 @@ LIGHTER_HDR_KEY = os.environ.get("LIGHTER_HDR_KEY", "X-API-KEY")
 LIGHTER_HDR_SIG = os.environ.get("LIGHTER_HDR_SIG", "X-SIGN")
 LIGHTER_HDR_TS  = os.environ.get("LIGHTER_HDR_TS", "X-TS")
 
+# Debug switch for Lighter requests (logs status & short body)
+LIGHTER_DEBUG = os.environ.get("LIGHTER_DEBUG", "0") == "1"
+
 LIGHTER_ENABLED = bool(LIGHTER_API_BASE and LIGHTER_KEY and LIGHTER_SECRET)
 
-# Fees only (bps) — no slippage (per your request)
+# Fees only (bps) — no slippage
 FEE_BPS_EXT_OPEN  = float(os.environ.get("FEE_BPS_EXT_OPEN",  "22"))
 FEE_BPS_EXT_CLOSE = float(os.environ.get("FEE_BPS_EXT_CLOSE", "22"))
 FEE_BPS_LIG_OPEN  = float(os.environ.get("FEE_BPS_LIG_OPEN",  "0"))
@@ -101,6 +104,7 @@ async def fetch_lighter_tob(client: httpx.AsyncClient, asset: str) -> Optional[T
         symbol = LIGHTER_MARKETS.get(asset)
         if not symbol:
             return None
+
         ts = str(int(time.time() * 1000))
         method = "GET"
         path = "/orderBookOrders"
@@ -112,7 +116,15 @@ async def fetch_lighter_tob(client: httpx.AsyncClient, asset: str) -> Optional[T
         sig = hmac.new((LIGHTER_SECRET or "").encode(), prehash.encode(), hashlib.sha256).hexdigest()
         headers = {LIGHTER_HDR_KEY: (LIGHTER_KEY or ""), LIGHTER_HDR_SIG: sig, LIGHTER_HDR_TS: ts}
 
-        r = await client.get(f"{LIGHTER_API_BASE}{path}", params={"market": symbol}, headers=headers, timeout=10)
+        url = f"{LIGHTER_API_BASE}{path}"
+        r = await client.get(url, params={"market": symbol}, headers=headers, timeout=10)
+
+        if LIGHTER_DEBUG and r.status_code != 200:
+            body = r.text
+            if len(body) > 300:
+                body = body[:300] + "...(truncated)"
+            print(f"[LIGHTER_DEBUG] {r.status_code} {url}  resp={body}")
+
         r.raise_for_status()
         j = r.json()
         bids = j.get("bids") or j.get("bid") or []
@@ -123,7 +135,9 @@ async def fetch_lighter_tob(client: httpx.AsyncClient, asset: str) -> Optional[T
         bid = float(b0[0] if isinstance(b0, list) else b0.get("price"))
         ask = float(a0[0] if isinstance(a0, list) else a0.get("price"))
         return TopOfBook(bid=bid, ask=ask)
-    except Exception:
+    except Exception as e:
+        if LIGHTER_DEBUG:
+            print(f"[LIGHTER_DEBUG] Exception for {asset}: {e}")
         return None
 
 async def get_quotes(client: httpx.AsyncClient, asset: str) -> VenueQuotes:
@@ -243,6 +257,23 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"LIGHTER   bid={getattr(lig,'bid','—')}  ask={getattr(lig,'ask','—')}")
     await update.message.reply_text("\n".join(lines))
 
+def _mask(s: Optional[str], keep: int = 4) -> str:
+    if not s:
+        return "(empty)"
+    if len(s) <= keep*2:
+        return s[0:keep] + "..." + s[-keep:]
+    return s[0:keep] + "..." + s[-keep:]
+
+async def cmd_lighter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = ["Lighter status:"]
+    lines.append(f"enabled: {LIGHTER_ENABLED}")
+    lines.append(f"base: {LIGHTER_API_BASE or '(unset)'}")
+    lines.append(f"hdr_key: {LIGHTER_HDR_KEY}, hdr_sig: {LIGHTER_HDR_SIG}, hdr_ts: {LIGHTER_HDR_TS}")
+    lines.append(f"api_key (masked): {_mask(LIGHTER_KEY)}")
+    lines.append(f"secret (masked):  {_mask(LIGHTER_SECRET)}")
+    lines.append(f"debug: {'on' if LIGHTER_DEBUG else 'off'}")
+    await update.message.reply_text("\n".join(lines))
+
 # =========================
 # App bootstrap (async)
 # =========================
@@ -259,6 +290,7 @@ async def async_main():
     application.add_handler(CommandHandler("ping",      cmd_ping))
     application.add_handler(CommandHandler("id",        cmd_id))
     application.add_handler(CommandHandler("probe",     cmd_probe))
+    application.add_handler(CommandHandler("lighter",   cmd_lighter))
 
     # Start bot & our background loop
     await application.initialize()
