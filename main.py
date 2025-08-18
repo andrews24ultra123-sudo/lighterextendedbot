@@ -72,10 +72,21 @@ class VenueQuotes(BaseModel):
 
 # Map asset -> market symbol per venue
 EXT_MARKETS = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD"}
-LIGHTER_MARKETS = {"BTC": "BTC-PERP", "ETH": "ETH-PERP", "SOL": "SOL-PERP"}  # adjust if their symbols differ
+# Lighter REST uses market_id. We'll discover the ids from /orderBooks, but keep desired symbols here:
+LIGHTER_SYMBOLS = {"BTC": "BTC-PERP", "ETH": "ETH-PERP", "SOL": "SOL-PERP"}
 
+# Cache for Lighter symbol -> market_id
+_LIGHTER_MARKET_ID: Dict[str, int] = {}
+
+def _mask(s: Optional[str], keep: int = 4) -> str:
+    if not s:
+        return "(empty)"
+    if len(s) <= keep*2:
+        return s[0:keep] + "..." + s[-keep:]
+    return s[0:keep] + "..." + s[-keep:]
+
+# ---------- Extended ----------
 async def fetch_extended_tob(client: httpx.AsyncClient, asset: str) -> Optional[TopOfBook]:
-    """Extended orderbook (public)."""
     try:
         market = EXT_MARKETS.get(asset)
         if not market:
@@ -85,8 +96,7 @@ async def fetch_extended_tob(client: httpx.AsyncClient, asset: str) -> Optional[
         r.raise_for_status()
         j = r.json()
         data = j.get("data", {}) if isinstance(j, dict) else {}
-        bids = data.get("bid", [])
-        asks = data.get("ask", [])
+        bids = data.get("bid", []); asks = data.get("ask", [])
         if not bids or not asks:
             return None
         b0 = bids[0]; a0 = asks[0]
@@ -96,28 +106,82 @@ async def fetch_extended_tob(client: httpx.AsyncClient, asset: str) -> Optional[
     except Exception:
         return None
 
+# ---------- Lighter market discovery ----------
+async def lighter_discover_markets(client: httpx.AsyncClient) -> None:
+    """
+    Populate _LIGHTER_MARKET_ID from GET /orderBooks.
+    We try to match the 'symbol' field to LIGHTER_SYMBOLS (e.g., 'BTC-PERP').
+    """
+    if not LIGHTER_ENABLED:
+        return
+    try:
+        url = f"{LIGHTER_API_BASE}/orderBooks"
+        r = await client.get(url, timeout=10)
+        if LIGHTER_DEBUG and r.status_code != 200:
+            body = r.text
+            if len(body) > 300:
+                body = body[:300] + "...(truncated)"
+            print(f"[LIGHTER_DEBUG] {r.status_code} {url}  resp={body}")
+        r.raise_for_status()
+        data = r.json()
+        # Expect an array of markets; figure out fields
+        # We'll try common field names: 'id' or 'market_id', and 'symbol' or 'name'
+        if isinstance(data, dict) and "data" in data:
+            markets = data["data"]
+        else:
+            markets = data
+        for m in markets or []:
+            symbol = m.get("symbol") or m.get("name") or m.get("market") or ""
+            mid = m.get("id") if "id" in m else m.get("market_id")
+            if symbol and mid is not None:
+                _LIGHTER_MARKET_ID[str(symbol).upper()] = int(mid)
+        if LIGHTER_DEBUG:
+            print("[LIGHTER_DEBUG] discovered markets:",
+                  {k: v for k, v in _LIGHTER_MARKET_ID.items() if k in {v.upper() for v in LIGHTER_SYMBOLS.values()}})
+    except Exception as e:
+        if LIGHTER_DEBUG:
+            print("[LIGHTER_DEBUG] market discovery failed:", e)
+
+def lighter_sign(ts: str, method: str, path: str, query: str) -> Dict[str, str]:
+    prehash = f"{ts}{method}{path}?{query}"
+    sig = hmac.new((LIGHTER_SECRET or "").encode(), prehash.encode(), hashlib.sha256).hexdigest()
+    return {
+        LIGHTER_HDR_KEY: (LIGHTER_KEY or ""),
+        LIGHTER_HDR_SIG: sig,
+        LIGHTER_HDR_TS: ts,
+    }
+
+# ---------- Lighter order book ----------
 async def fetch_lighter_tob(client: httpx.AsyncClient, asset: str) -> Optional[TopOfBook]:
-    """Lighter orderbook (signed; requires API key + secret)."""
     if not LIGHTER_ENABLED:
         return None
     try:
-        symbol = LIGHTER_MARKETS.get(asset)
-        if not symbol:
+        desired_symbol = LIGHTER_SYMBOLS.get(asset)
+        if not desired_symbol:
             return None
+
+        # ensure we have the market_id
+        if not _LIGHTER_MARKET_ID:
+            await lighter_discover_markets(client)
+
+        market_id = _LIGHTER_MARKET_ID.get(desired_symbol.upper())
+        if market_id is None:
+            # Try a second discovery (maybe API returned different key names)
+            await lighter_discover_markets(client)
+            market_id = _LIGHTER_MARKET_ID.get(desired_symbol.upper())
+            if market_id is None:
+                if LIGHTER_DEBUG:
+                    print(f"[LIGHTER_DEBUG] no market_id for {desired_symbol} yet")
+                return None
 
         ts = str(int(time.time() * 1000))
         method = "GET"
         path = "/orderBookOrders"
-        query = f"market={symbol}"
-
-        # Generic HMAC-SHA256 signing template (override header names via env if needed)
-        # If Lighter's docs specify a different prehash, change it here.
-        prehash = f"{ts}{method}{path}?{query}"
-        sig = hmac.new((LIGHTER_SECRET or "").encode(), prehash.encode(), hashlib.sha256).hexdigest()
-        headers = {LIGHTER_HDR_KEY: (LIGHTER_KEY or ""), LIGHTER_HDR_SIG: sig, LIGHTER_HDR_TS: ts}
+        query = f"market_id={market_id}"
+        headers = lighter_sign(ts, method, path, query)
 
         url = f"{LIGHTER_API_BASE}{path}"
-        r = await client.get(url, params={"market": symbol}, headers=headers, timeout=10)
+        r = await client.get(url, params={"market_id": market_id}, headers=headers, timeout=10)
 
         if LIGHTER_DEBUG and r.status_code != 200:
             body = r.text
@@ -257,13 +321,6 @@ async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"LIGHTER   bid={getattr(lig,'bid','—')}  ask={getattr(lig,'ask','—')}")
     await update.message.reply_text("\n".join(lines))
 
-def _mask(s: Optional[str], keep: int = 4) -> str:
-    if not s:
-        return "(empty)"
-    if len(s) <= keep*2:
-        return s[0:keep] + "..." + s[-keep:]
-    return s[0:keep] + "..." + s[-keep:]
-
 async def cmd_lighter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["Lighter status:"]
     lines.append(f"enabled: {LIGHTER_ENABLED}")
@@ -272,6 +329,11 @@ async def cmd_lighter(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"api_key (masked): {_mask(LIGHTER_KEY)}")
     lines.append(f"secret (masked):  {_mask(LIGHTER_SECRET)}")
     lines.append(f"debug: {'on' if LIGHTER_DEBUG else 'off'}")
+    # Also show discovered IDs:
+    if _LIGHTER_MARKET_ID:
+        lines.append("market_id map: " + ", ".join(f"{k}={v}" for k, v in _LIGHTER_MARKET_ID.items()))
+    else:
+        lines.append("market_id map: (empty)")
     await update.message.reply_text("\n".join(lines))
 
 # =========================
