@@ -34,7 +34,7 @@ if _pair_raw:
             except Exception:
                 pass
 
-# Pairs to track
+# Pairs to track (change live via /setpairs)
 ASSETS: List[str] = ["BTC", "ETH", "SOL"]
 
 # Venue API bases
@@ -69,9 +69,10 @@ class VenueQuotes(BaseModel):
 
 # Map asset -> market symbol per venue
 EXT_MARKETS = {"BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD"}
-LIGHTER_MARKETS = {"BTC": "BTC-PERP", "ETH": "ETH-PERP", "SOL": "SOL-PERP"}  # adjust if needed
+LIGHTER_MARKETS = {"BTC": "BTC-PERP", "ETH": "ETH-PERP", "SOL": "SOL-PERP"}  # adjust if their symbols differ
 
 async def fetch_extended_tob(client: httpx.AsyncClient, asset: str) -> Optional[TopOfBook]:
+    """Extended orderbook (public)."""
     try:
         market = EXT_MARKETS.get(asset)
         if not market:
@@ -93,6 +94,7 @@ async def fetch_extended_tob(client: httpx.AsyncClient, asset: str) -> Optional[
         return None
 
 async def fetch_lighter_tob(client: httpx.AsyncClient, asset: str) -> Optional[TopOfBook]:
+    """Lighter orderbook (signed; requires API key + secret)."""
     if not LIGHTER_ENABLED:
         return None
     try:
@@ -100,10 +102,16 @@ async def fetch_lighter_tob(client: httpx.AsyncClient, asset: str) -> Optional[T
         if not symbol:
             return None
         ts = str(int(time.time() * 1000))
-        method = "GET"; path = "/orderBookOrders"; query = f"market={symbol}"
+        method = "GET"
+        path = "/orderBookOrders"
+        query = f"market={symbol}"
+
+        # Generic HMAC-SHA256 signing template (override header names via env if needed)
+        # If Lighter's docs specify a different prehash, change it here.
         prehash = f"{ts}{method}{path}?{query}"
         sig = hmac.new((LIGHTER_SECRET or "").encode(), prehash.encode(), hashlib.sha256).hexdigest()
-        headers = {LIGHTER_HDR_KEY: LIGHTER_KEY or "", LIGHTER_HDR_SIG: sig, LIGHTER_HDR_TS: ts}
+        headers = {LIGHTER_HDR_KEY: (LIGHTER_KEY or ""), LIGHTER_HDR_SIG: sig, LIGHTER_HDR_TS: ts}
+
         r = await client.get(f"{LIGHTER_API_BASE}{path}", params={"market": symbol}, headers=headers, timeout=10)
         r.raise_for_status()
         j = r.json()
@@ -130,12 +138,12 @@ def _roundtrip_bps(direction: str) -> float:
     return FEE_BPS_LIG_OPEN + FEE_BPS_EXT_OPEN + FEE_BPS_LIG_CLOSE + FEE_BPS_EXT_CLOSE
 
 def best_net_edge(q: VenueQuotes) -> Tuple[float, str, str]:
-    """Returns (net_edge_pct, direction, detail)."""
+    """Returns (net_edge_pct, direction, detail) or (0, 'N/A', reason)."""
     ext, lig = q.extended, q.lighter
     if not ext or not lig:
         return (0.0, "N/A", "Lighter disabled or missing data")
-    gross1 = (lig.bid - ext.ask) / ext.ask   # EXT->LIG
-    gross2 = (ext.bid - lig.ask) / lig.ask   # LIG->EXT
+    gross1 = (lig.bid - ext.ask) / ext.ask   # EXT->LIG: buy ask EXT, sell bid LIG
+    gross2 = (ext.bid - lig.ask) / lig.ask   # LIG->EXT: buy ask LIG, sell bid EXT
     net1 = gross1 - _roundtrip_bps("EXT->LIG") / 10000.0
     net2 = gross2 - _roundtrip_bps("LIG->EXT") / 10000.0
     if net1 >= net2:
@@ -174,8 +182,13 @@ async def check_and_alert(application) -> None:
                         print("Telegram send error:", e)
 
 async def background_loop(application):
-    # simple polling loop; no JobQueue required
-    await application.bot.send_message(chat_id=CHAT_ID, text="✅ Bot started. Send /start or /top.")
+    # Notify on startup so you know it's alive
+    try:
+        await application.bot.send_message(chat_id=CHAT_ID, text="✅ Bot started. Send /start or /top.")
+    except Exception as e:
+        print("Startup DM failed (check TELEGRAM_CHAT_ID & token):", e)
+
+    # Simple loop, no JobQueue needed
     while True:
         try:
             await check_and_alert(application)
@@ -191,7 +204,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Hi! Monitoring {', '.join(ASSETS)}.\n"
         f"Global threshold: {THRESHOLD_PCT}%\n"
         f"Per-pair: {THRESHOLDS_PER_PAIR or '(none)'}\n"
-        f"Use /top to view current edges, /setpairs to change pairs."
+        f"Use /top to view current edges, /setpairs to change pairs, /probe BTC to inspect feeds."
     )
 
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -208,9 +221,27 @@ async def cmd_setpairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = " ".join(context.args)
     parts = [p.strip().upper() for p in raw.replace(",", " ").split() if p.strip()]
     if not parts:
-        return await update.message.reply_text("Usage: /setpairs BTC,ETH,SOL")
+        return await update.message.reply_text("Usage: /setpairs BTC,ETH,SOL or /setpairs BTC ETH SOL")
     ASSETS = parts
     await update.message.reply_text("Pairs set to: " + ", ".join(ASSETS))
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong ✅")
+
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"chat id: {update.effective_chat.id}")
+
+async def cmd_probe(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inspect raw best bid/ask from both venues for a given asset (default BTC)."""
+    asset = (context.args[0].upper() if context.args else "BTC")
+    async with httpx.AsyncClient() as client:
+        ext = await fetch_extended_tob(client, asset)
+        lig = await fetch_lighter_tob(client, asset)
+
+    lines = [f"🔍 PROBE {asset}"]
+    lines.append(f"EXTENDED  bid={getattr(ext,'bid','—')}  ask={getattr(ext,'ask','—')}")
+    lines.append(f"LIGHTER   bid={getattr(lig,'bid','—')}  ask={getattr(lig,'ask','—')}")
+    await update.message.reply_text("\n".join(lines))
 
 # =========================
 # App bootstrap (async)
@@ -220,19 +251,23 @@ async def async_main():
         raise SystemExit("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID env vars.")
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("top", cmd_top))
-    application.add_handler(CommandHandler("setpairs", cmd_setpairs))
 
-    # Start bot & our own background loop (no JobQueue)
+    # Commands
+    application.add_handler(CommandHandler("start",     cmd_start))
+    application.add_handler(CommandHandler("top",       cmd_top))
+    application.add_handler(CommandHandler("setpairs",  cmd_setpairs))
+    application.add_handler(CommandHandler("ping",      cmd_ping))
+    application.add_handler(CommandHandler("id",        cmd_id))
+    application.add_handler(CommandHandler("probe",     cmd_probe))
+
+    # Start bot & our background loop
     await application.initialize()
     await application.start()
     print("Bot started (async).")
     asyncio.create_task(background_loop(application))
 
-    # Start receiving updates
+    # Start receiving updates & keep process alive
     await application.updater.start_polling()
-    # Keep process alive
     await asyncio.Event().wait()
 
 def main():
